@@ -1,9 +1,8 @@
-// server.js - TripUs AI WebSocket Server
+// server.js - TripUs AI WebSocket Server (Railway Compatible)
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
-import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -29,10 +28,29 @@ app.use(express.json());
 
 // Health check endpoint
 app.get('/health', (req, res) => {
+  try {
+    res.json({ 
+      status: 'healthy', 
+      connections: io.engine.clientsCount,
+      timestamp: new Date().toISOString(),
+      server: 'tripus-websocket-server',
+      version: '1.0.0'
+    });
+  } catch (error) {
+    console.error('Health check error:', error);
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
   res.json({ 
-    status: 'healthy', 
-    connections: io.engine.clientsCount,
-    timestamp: new Date().toISOString()
+    message: 'TripUs AI WebSocket Server', 
+    status: 'running',
+    endpoints: {
+      health: '/health',
+      websocket: '/socket.io/'
+    }
   });
 });
 
@@ -225,8 +243,10 @@ io.use(async (socket, next) => {
     socket.userAvatar = socket.handshake.auth.userAvatar || '';
     socket.tripId = socket.handshake.auth.tripId || 'demo-trip';
     
+    console.log(`User ${socket.userId} authenticating for trip ${socket.tripId}`);
     next();
   } catch (err) {
+    console.error('Authentication error:', err);
     next(new Error('Authentication failed'));
   }
 });
@@ -235,191 +255,208 @@ io.use(async (socket, next) => {
 io.on('connection', (socket) => {
   console.log(`User ${socket.userId} connected to trip ${socket.tripId}`);
   
-  // Join trip room
-  socket.join(`trip:${socket.tripId}`);
-  
-  // Get or create trip session
-  let session = tripSessions.get(socket.tripId);
-  if (!session) {
-    session = new TripSession(socket.tripId);
-    tripSessions.set(socket.tripId, session);
-  }
-  
-  // Add member to session
-  session.addMember(socket.userId, socket.id, {
-    name: socket.userName,
-    avatar: socket.userAvatar,
-  });
-  
-  // Notify others that user joined
-  socket.to(`trip:${socket.tripId}`).emit('member:joined', {
-    userId: socket.userId,
-    name: socket.userName,
-    avatar: socket.userAvatar,
-  });
-  
-  // Send current trip state to new member
-  socket.emit('trip:state', session.getPublicData());
-  
-  // Location update handler
-  socket.on('location:update', (locationData) => {
-    const member = session.updateLocation(socket.userId, locationData);
+  try {
+    // Join trip room
+    socket.join(`trip:${socket.tripId}`);
     
-    if (member) {
-      // Broadcast location update to all trip members
-      io.to(`trip:${socket.tripId}`).emit('member:location', {
+    // Get or create trip session
+    let session = tripSessions.get(socket.tripId);
+    if (!session) {
+      session = new TripSession(socket.tripId);
+      tripSessions.set(socket.tripId, session);
+      console.log(`Created new trip session: ${socket.tripId}`);
+    }
+    
+    // Add member to session
+    session.addMember(socket.userId, socket.id, {
+      name: socket.userName,
+      avatar: socket.userAvatar,
+    });
+    
+    // Notify others that user joined
+    socket.to(`trip:${socket.tripId}`).emit('member:joined', {
+      userId: socket.userId,
+      name: socket.userName,
+      avatar: socket.userAvatar,
+    });
+    
+    // Send current trip state to new member
+    socket.emit('trip:state', session.getPublicData());
+    
+    // Location update handler
+    socket.on('location:update', (locationData) => {
+      try {
+        const member = session.updateLocation(socket.userId, locationData);
+        
+        if (member) {
+          // Broadcast location update to all trip members
+          io.to(`trip:${socket.tripId}`).emit('member:location', {
+            userId: socket.userId,
+            location: member.location,
+            speed: member.speed,
+            heading: member.heading,
+            status: member.status,
+            hasArrived: member.hasArrived,
+          });
+          
+          // Check for alerts (e.g., member stopped for too long)
+          if (member.status === 'stopped' && member.speed === 0) {
+            const stoppedDuration = Date.now() - member.location.timestamp;
+            if (stoppedDuration > 600000) { // 10 minutes
+              io.to(`trip:${socket.tripId}`).emit('alert:member_stopped', {
+                userId: socket.userId,
+                name: member.name,
+                duration: Math.floor(stoppedDuration / 60000),
+              });
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Location update error:', error);
+        socket.emit('error', { message: 'Failed to update location' });
+      }
+    });
+    
+    // Voice broadcast (leader only)
+    socket.on('voice:broadcast', async (data) => {
+      if (session.leader !== socket.userId) {
+        return socket.emit('error', { message: 'Only the leader can broadcast voice messages' });
+      }
+      
+      // Broadcast voice message to all members
+      socket.to(`trip:${socket.tripId}`).emit('voice:message', {
         userId: socket.userId,
-        location: member.location,
-        speed: member.speed,
-        heading: member.heading,
-        status: member.status,
-        hasArrived: member.hasArrived,
+        name: socket.userName,
+        message: data.message,
+        duration: data.duration,
+        timestamp: Date.now(),
+      });
+    });
+    
+    // Set trip leader
+    socket.on('leader:set', (data) => {
+      session.setLeader(data.userId);
+      
+      io.to(`trip:${socket.tripId}`).emit('leader:changed', {
+        userId: data.userId,
+        name: session.members.get(data.userId)?.name,
+      });
+    });
+    
+    // Start leading (Follow the Leader mode)
+    socket.on('leader:start', () => {
+      session.setLeader(socket.userId);
+      
+      io.to(`trip:${socket.tripId}`).emit('leader:started', {
+        userId: socket.userId,
+        name: socket.userName,
+        message: `${socket.userName} is now leading the group`,
+      });
+    });
+    
+    // Request to follow leader
+    socket.on('follow:request', () => {
+      if (!session.leader) {
+        return socket.emit('error', { message: 'No leader to follow' });
+      }
+      
+      const leaderBreadcrumbs = session.getBreadcrumbs(session.leader);
+      
+      socket.emit('follow:breadcrumbs', {
+        leaderId: session.leader,
+        breadcrumbs: leaderBreadcrumbs,
+      });
+    });
+    
+    // Set destination
+    socket.on('destination:set', (destination) => {
+      session.destination = destination;
+      
+      io.to(`trip:${socket.tripId}`).emit('destination:updated', destination);
+    });
+    
+    // Send message/alert
+    socket.on('message:send', (data) => {
+      io.to(`trip:${socket.tripId}`).emit('message:received', {
+        userId: socket.userId,
+        name: socket.userName,
+        message: data.message,
+        type: data.type || 'text',
+        timestamp: Date.now(),
+      });
+    });
+    
+    // Emergency SOS
+    socket.on('sos:send', () => {
+      io.to(`trip:${socket.tripId}`).emit('sos:alert', {
+        userId: socket.userId,
+        name: socket.userName,
+        location: session.members.get(socket.userId)?.location,
+        timestamp: Date.now(),
       });
       
-      // Check for alerts (e.g., member stopped for too long)
-      if (member.status === 'stopped' && member.speed === 0) {
-        const stoppedDuration = Date.now() - member.location.timestamp;
-        if (stoppedDuration > 600000) { // 10 minutes
-          io.to(`trip:${socket.tripId}`).emit('alert:member_stopped', {
-            userId: socket.userId,
-            name: member.name,
-            duration: Math.floor(stoppedDuration / 60000),
-          });
-        }
-      }
-    }
-  });
-  
-  // Voice broadcast (leader only)
-  socket.on('voice:broadcast', async (data) => {
-    if (session.leader !== socket.userId) {
-      return socket.emit('error', { message: 'Only the leader can broadcast voice messages' });
-    }
-    
-    // Broadcast voice message to all members
-    socket.to(`trip:${socket.tripId}`).emit('voice:message', {
-      userId: socket.userId,
-      name: socket.userName,
-      message: data.message,
-      duration: data.duration,
-      timestamp: Date.now(),
-    });
-  });
-  
-  // Set trip leader
-  socket.on('leader:set', (data) => {
-    session.setLeader(data.userId);
-    
-    io.to(`trip:${socket.tripId}`).emit('leader:changed', {
-      userId: data.userId,
-      name: session.members.get(data.userId)?.name,
-    });
-  });
-  
-  // Start leading (Follow the Leader mode)
-  socket.on('leader:start', () => {
-    session.setLeader(socket.userId);
-    
-    io.to(`trip:${socket.tripId}`).emit('leader:started', {
-      userId: socket.userId,
-      name: socket.userName,
-      message: `${socket.userName} is now leading the group`,
-    });
-  });
-  
-  // Request to follow leader
-  socket.on('follow:request', () => {
-    if (!session.leader) {
-      return socket.emit('error', { message: 'No leader to follow' });
-    }
-    
-    const leaderBreadcrumbs = session.getBreadcrumbs(session.leader);
-    
-    socket.emit('follow:breadcrumbs', {
-      leaderId: session.leader,
-      breadcrumbs: leaderBreadcrumbs,
-    });
-  });
-  
-  // Set destination
-  socket.on('destination:set', (destination) => {
-    session.destination = destination;
-    
-    io.to(`trip:${socket.tripId}`).emit('destination:updated', destination);
-  });
-  
-  // Send message/alert
-  socket.on('message:send', (data) => {
-    io.to(`trip:${socket.tripId}`).emit('message:received', {
-      userId: socket.userId,
-      name: socket.userName,
-      message: data.message,
-      type: data.type || 'text',
-      timestamp: Date.now(),
-    });
-  });
-  
-  // Emergency SOS
-  socket.on('sos:send', () => {
-    io.to(`trip:${socket.tripId}`).emit('sos:alert', {
-      userId: socket.userId,
-      name: socket.userName,
-      location: session.members.get(socket.userId)?.location,
-      timestamp: Date.now(),
+      // Could also trigger external notifications here
+      console.log(`🆘 SOS Alert from ${socket.userName} in trip ${socket.tripId}`);
     });
     
-    // Could also trigger external notifications here
-    console.log(`SOS Alert from ${socket.userName} in trip ${socket.tripId}`);
-  });
-  
-  // Meeting point suggestion
-  socket.on('meeting:suggest', (data) => {
-    io.to(`trip:${socket.tripId}`).emit('meeting:point', {
-      suggestedBy: socket.userId,
-      name: socket.userName,
-      location: data.location,
-      placeName: data.placeName,
-      timestamp: Date.now(),
+    // Meeting point suggestion
+    socket.on('meeting:suggest', (data) => {
+      io.to(`trip:${socket.tripId}`).emit('meeting:point', {
+        suggestedBy: socket.userId,
+        name: socket.userName,
+        location: data.location,
+        placeName: data.placeName,
+        timestamp: Date.now(),
+      });
     });
-  });
-  
-  // Get trip statistics
-  socket.on('stats:request', () => {
-    socket.emit('stats:update', session.getMemberStats());
-  });
+    
+    // Get trip statistics
+    socket.on('stats:request', () => {
+      socket.emit('stats:update', session.getMemberStats());
+    });
+    
+  } catch (error) {
+    console.error('Socket connection error:', error);
+    socket.emit('error', { message: 'Connection setup failed' });
+  }
   
   // Disconnect handling
   socket.on('disconnect', () => {
     console.log(`User ${socket.userId} disconnected from trip ${socket.tripId}`);
     
-    // Don't immediately remove - mark as offline
-    const member = session.members.get(socket.userId);
-    if (member) {
-      member.status = 'offline';
-      member.lastSeen = Date.now();
-      
-      // Notify others
-      socket.to(`trip:${socket.tripId}`).emit('member:offline', {
-        userId: socket.userId,
-        name: socket.userName,
-      });
-      
-      // Remove after timeout (5 minutes)
-      setTimeout(() => {
-        if (session.members.get(socket.userId)?.status === 'offline') {
-          session.removeMember(socket.userId);
-          
-          io.to(`trip:${socket.tripId}`).emit('member:left', {
-            userId: socket.userId,
-            name: socket.userName,
-          });
-          
-          // Clean up empty sessions
-          if (session.members.size === 0) {
-            tripSessions.delete(socket.tripId);
+    try {
+      // Don't immediately remove - mark as offline
+      const member = session?.members.get(socket.userId);
+      if (member) {
+        member.status = 'offline';
+        member.lastSeen = Date.now();
+        
+        // Notify others
+        socket.to(`trip:${socket.tripId}`).emit('member:offline', {
+          userId: socket.userId,
+          name: socket.userName,
+        });
+        
+        // Remove after timeout (5 minutes)
+        setTimeout(() => {
+          if (session?.members.get(socket.userId)?.status === 'offline') {
+            session.removeMember(socket.userId);
+            
+            io.to(`trip:${socket.tripId}`).emit('member:left', {
+              userId: socket.userId,
+              name: socket.userName,
+            });
+            
+            // Clean up empty sessions
+            if (session.members.size === 0) {
+              tripSessions.delete(socket.tripId);
+              console.log(`Cleaned up empty session: ${socket.tripId}`);
+            }
           }
-        }
-      }, 300000); // 5 minutes
+        }, 300000); // 5 minutes
+      }
+    } catch (error) {
+      console.error('Disconnect handling error:', error);
     }
   });
 });
@@ -437,8 +474,19 @@ setInterval(() => {
   }
 }, 300000); // Every 5 minutes
 
+// Error handling
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
 // Start server
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 8080;
 httpServer.listen(PORT, () => {
-  console.log(`TripUs AI WebSocket server running on port ${PORT}`);
+  console.log(`🚀 TripUs AI WebSocket server running on port ${PORT}`);
+  console.log(`📡 Health check: /health`);
+  console.log(`🔌 WebSocket: /socket.io/`);
 });
