@@ -425,6 +425,8 @@ io.on('connection', (socket) => {
     console.log(`User ${socket.userId} disconnected from trip ${socket.tripId}`);
     
     try {
+      const session = tripSessions.get(socket.tripId); // ← ADD THIS LINE
+      
       // Don't immediately remove - mark as offline
       const member = session?.members.get(socket.userId);
       if (member) {
